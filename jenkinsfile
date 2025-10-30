@@ -14,6 +14,7 @@ pipeline {
         SONAR_TOKEN = credentials('aum-sonarcloud-token')
 
     }
+   
      stages {
         stage('Cleanup') {
             steps {
@@ -115,6 +116,7 @@ pipeline {
                 script {
                     sh 'docker rm  jenkins_app -f || true'
                     sh 'docker image rmi $DOCKERHUB_USER/$IMAGE_NAME:latest || true'
+                    sh 'docker rm python-new-app -f || true'
                 }
             }  
         }
@@ -147,8 +149,7 @@ pipeline {
         # Use Bash explicitly so "pipefail" works
         set -euxo pipefail
  
-        TARGET_URL="http://52.207.143.247:8005"
- 
+        TARGET_URL="http://44.223.83.148:8005"
         echo "🔄 Waiting for app to start..."
         for i in {1..10}; do
             if curl -s --max-time 5 $TARGET_URL >/dev/null; then
