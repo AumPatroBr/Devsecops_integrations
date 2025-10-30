@@ -2,10 +2,12 @@
 from flask import Flask, jsonify
 from redis_client import get_redis_client
 import logging
-
+from flask_wtf import CSRFProtect
 
 
 app = Flask(__name__) # nosec B107  # CSRF not applicable for API-only app
+csrf = CSRFProtect()
+csrf.init_app(app) # Compliant
 redis_client = get_redis_client()
 
 # Logging Sensitive Information
