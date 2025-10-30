@@ -4,3 +4,4 @@ pytest
 pytest-cov
 requests
 gunicorn
+flask_wtf
