@@ -1,8 +1,10 @@
 pipeline {
-    agent { label 'aum-security-agent' }
-
+    agent {
+        label 'aum-ubuntu-node'
+    }
     triggers {
-        pollSCM('H/3 * * * *') // Poll every 3 mins (or use webhook)
+        pollSCM('H/3 * * * *') // checks every 3 mins, or
+        // OR use GitHub webhook instead (recommended)
     }
 
     environment {
@@ -12,58 +14,77 @@ pipeline {
         SONAR_TOKEN = credentials('aum-sonarcloud-token')
 
     }
-
-    stages {
-
-        stage('S1 - Clean Workspace') {
+     stages {
+        stage('Cleanup') {
             steps {
                 cleanWs()
             }
         }
-
-        stage('S2 - Checkout SCM') {
+        stage('Checkout') {
             steps {
                 checkout scm
             }
         }
-
-        stage('S3 - GitLeaks Scan') {
+         stage('GitLeaks Scan') {
             steps {
                 sh '''#!/bin/bash
                     set -eux
+                    # Install gitleaks if not present
                     if ! command -v gitleaks &> /dev/null; then
+                        echo "Installing Gitleaks..."
                         wget https://github.com/zricethezav/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz
                         tar -xzf gitleaks_8.18.1_linux_x64.tar.gz
                         chmod +x gitleaks
                         sudo mv gitleaks /usr/local/bin/
                     fi
+                    # Run gitleaks detect even if from non commited codes
 
-                    exit_code=0
-                    if ! gitleaks detect --source . --no-git --verbose --report-path gitleaks-report.json; then
-                        exit_code=$?
-                    fi
 
-                    if [ "$exit_code" -ne 0 ]; then
-                        echo "❌ Gitleaks found leaks"
-                        exit 1
-                    else
-                        echo "✅ No leaks found"
-                    fi
+                    echo "🔍 Running Gitleaks scan..."
+                    set +e  # temporarily disable fail-fast
+                    gitleaks detect --source python_app --no-git --verbose --report-path gitleaks-report.json 
+                    result=$?  # capture exit status
+                    set -e  # re-enable fail-fast
+
+                if [ "$result" -ne 0 ]; then
+                    echo "❌ Gitleaks found leaks (exit code $result)"
+                    exit 1
+                else
+                    echo "✅ No leaks found."
+                fi
                 '''
             }
         }
 
-        stage('S4 - SonarQube Analysis') {
+        stage('Python Setup & Test with Coverage') {
             steps {
-               withSonarQubeEnv(credentialsId: 'aum-sonarcloud-token', installationName: 'aum-sq') {
+                dir('python_app') {
+                    sh '''#!/bin/bash
+                        set -euxo pipefail
+                        rm -rf venv
+                        python3 -m venv venv
+                        ./venv/bin/pip install --upgrade pip
+                        ./venv/bin/pip install -r requirements.txt
+                        ./venv/bin/python -m pytest tests/ --maxfail=1 --disable-warnings -q \
+                            --cov=. --cov-report=xml:../coverage.xml
+                    '''               
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv(credentialsId: 'aum-sonarcloud-token', installationName: 'aum-sq') {
                     sh '''#!/bin/bash
                         set -eux
+                        echo "=== SonarQube installation ==="
                         export SONAR_SCANNER_VERSION=7.2.0.5079
                         export SONAR_SCANNER_HOME=$HOME/.sonar/sonar-scanner-$SONAR_SCANNER_VERSION-linux-x64
                         curl --create-dirs -sSLo $HOME/.sonar/sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-$SONAR_SCANNER_VERSION-linux-x64.zip
                         unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
                         export PATH=$SONAR_SCANNER_HOME/bin:$PATH
 
+                        echo "=== Running SonarQube Scanner ==="
                         sonar-scanner \
                         -Dsonar.organization="aumpatrobr" \
                         -Dsonar.projectKey="AumPatroBr_Devsecops_integrations" \
@@ -74,79 +95,53 @@ pipeline {
                         -Dsonar.cpp.file.suffixes=- \
                         -Dsonar.objc.file.suffixes=- \
                         -Dsonar.login=$SONAR_TOKEN \
-                        -Dsonar.exclusions=**/venv/**,**/__pycache__/**,**/tests/**
-                    '''
+                        -Dsonar.exclusions=**/venv/**,**/__pycache__/**,**/tests/** \
+                        '''
                 }
             }
         }
-
-        stage('S5 - Quality Gate') {
+         stage('Quality Gate') {
             steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
+                script {
+                    timeout(time: 2, unit: 'MINUTES') {
+                        def qg = waitForQualityGate abortPipeline: true
+                        echo "Quality Gate status: ${qg.status}"
+                    }
                 }
             }
         }
-
-        stage('S6 - Docker Build for Python App') {
+        stage('Clean up image and container') {
             steps {
-                sh '''#!/bin/bash
-                    set -eux
-                    if [ ! -f python_app/Dockerfile ]; then
-                        echo "❌ Dockerfile not found in python_app directory"
-                        exit 1
-                    fi
-
-                    # Build from project root, using python_app/Dockerfile
-                    docker build -t $DOCKERHUB_USER/$IMAGE_NAME:latest -f python_app/Dockerfile .
-
-                    # Stop/remove existing container on port 8005 if any
-                    existing_container=$(docker ps -q --filter "publish=8005" || true)
-                    if [ -n "$existing_container" ]; then
-                        docker stop $existing_container || true
-                        docker rm $existing_container || true
-                    fi
+                script {
+                    sh 'docker rm  jenkins_app -f || true'
+                    sh 'docker image rmi $DOCKERHUB_USER/$IMAGE_NAME:latest || true'
+                }
+            }  
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh 'docker build -t $DOCKERHUB_USER/$IMAGE_NAME:latest python_app'
+                    sh 'docker run -d -p 8005:5000 --name python-new-app $DOCKERHUB_USER/$IMAGE_NAME:latest'
+                }
+            }
+        }
+        stage('Scan Docker Image with Trivy') {
+            steps {
+                // Scan and save report
+                sh '''
+                  mkdir -p trivy-reports
+                  trivy image --no-progress --exit-code 0 --format table -o trivy-reports/report.txt $DOCKERHUB_USER/$IMAGE_NAME
+                  cat trivy-reports/report.txt
                 '''
             }
         }
-
-
-        stage('S7 - Trivy Image Scan') {
+        stage('Archive Trivy Report') {
             steps {
-                sh '''#!/bin/bash
-                    set -eux
-                    if ! command -v trivy &> /dev/null; then
-                        echo "Installing Trivy..."
-                        sudo apt-get update -y
-                        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-                        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-                        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee /etc/apt/sources.list.d/trivy.list
-                        sudo apt-get update -y
-                        sudo apt-get install -y trivy
-                    fi
-
-                    echo "Running Trivy scan..."
-                    trivy image --exit-code 0 --severity HIGH,CRITICAL $DOCKERHUB_USER/$IMAGE_NAME:latest
-                '''
-            }
-        }
-
-        stage('S8 - Deploy App Locally') {
-            when {
-                expression { currentBuild.currentResult == 'SUCCESS' }
-            }
-            steps {
-                sh '''#!/bin/bash
-                    set -eux
-                    echo "Deploying application locally..."
-                    docker ps -q --filter "publish=8005" | xargs -r docker rm -f || true
-                    docker run -d -p 8005:5000 --name python_app $DOCKERHUB_USER/$IMAGE_NAME:latest
-                    echo "✅ Application deployed and running locally on port 8005"
-                '''
+                archiveArtifacts artifacts: 'trivy-reports/report.txt', fingerprint: true
             }
         }
         stage('OWASP ZAP Scan') {
-    agent { label 'ubuntu' }
     steps {
         sh '''#!/bin/bash
         # Use Bash explicitly so "pipefail" works
@@ -205,10 +200,10 @@ pipeline {
 
     post {
         success {
-            echo '✅ Pipeline completed and deployed successfully!'
+            echo 'Pipeline completed successfully!'
         }
         failure {
-            echo '❌ Pipeline failed.'
+            echo 'Pipeline failed.'
         }
     }
 }
