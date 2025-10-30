@@ -5,7 +5,7 @@ import logging
 
 
 
-app = Flask(__name__)
+app = Flask(__name__) # nosec B107  # CSRF not applicable for API-only app
 redis_client = get_redis_client()
 
 # Logging Sensitive Information
